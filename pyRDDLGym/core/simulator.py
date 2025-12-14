@@ -21,9 +21,9 @@ from pyRDDLGym.core.parser.expr import Value
 
 Args = Dict[str, Union[Value, np.ndarray]]
 
-        
+
 class RDDLSimulator:
-    
+
     def __init__(self, rddl: RDDLPlanningModel,
                  allow_synchronous_state: bool=True,
                  rng: np.random.Generator=np.random.default_rng(),
@@ -32,7 +32,7 @@ class RDDLSimulator:
                  objects_as_strings: bool=True,
                  python_functions: Optional[Dict[str, Callable]]=None) -> None:
         '''Creates a new simulator for the given RDDL model.
-        
+
         :param rddl: the RDDL model
         :param allow_synchronous_state: whether state-fluent can be synchronous
         :param rng: the random number generator
@@ -52,16 +52,20 @@ class RDDLSimulator:
         if python_functions is None:
             python_functions = {}
         self.python_functions = python_functions
-        
+
+        # Check if reward-vector is specified in domain requirements
+        requirements = rddl.ast.domain.requirements if rddl.ast else []
+        self.keep_reward_as_array = 'reward-vector' in requirements
+
         self._compile()
-        
+
         # basic operations
         self.ARITHMETIC_OPS = {
             '+': np.add,
             '-': np.subtract,
             '*': np.multiply,
             '/': np.divide
-        }    
+        }
         self.RELATIONAL_OPS = {
             '>=': np.greater_equal,
             '<=': np.less_equal,
@@ -90,7 +94,7 @@ class RDDLSimulator:
             'argmax': np.argmax
         }
         self.AGGREGATION_BOOL = {'forall', 'exists'}
-        self.UNARY = {        
+        self.UNARY = {
             'abs': np.abs,
             'sgn': lambda x: np.sign(x).astype(RDDLValueInitializer.INT),
             'round': lambda x: np.round(x).astype(RDDLValueInitializer.INT),
@@ -110,7 +114,7 @@ class RDDLSimulator:
             'sqrt': np.sqrt,
             'lngamma': lngamma,
             'gamma': lambda x: np.exp(lngamma(x))
-        }        
+        }
         self.BINARY = {
             'div': lambda x, y: np.floor_divide(x, y).astype(RDDLValueInitializer.INT),
             'mod': lambda x, y: np.mod(x, y).astype(RDDLValueInitializer.INT),
@@ -124,27 +128,63 @@ class RDDLSimulator:
         self.BINARY_REQUIRES_INT = {'div', 'mod'}
         self.CONTROL_OPS = {'if': np.where,
                             'switch': np.select}
-    
+
+        # Setup per-agent reward if reward-vector is enabled
+        if self.keep_reward_as_array:
+            self._setup_per_agent_reward()
+
+    def _setup_per_agent_reward(self):
+        """Setup per-agent reward computation from sum aggregation.
+
+        Expects reward to be: sum_{?a : agent_type} [individual_agent_reward]
+        Extracts the inner expression to compute per-agent rewards.
+        """
+        reward_expr = self.rddl.reward
+        etype, op = reward_expr.etype
+
+        if etype != 'aggregation' or op != 'sum':
+            raise ValueError(
+                f'reward-vector requirement expects reward to be a sum aggregation, '
+                f'but got {etype} {op}.')
+
+        # Extract the inner expression and agent variable
+        *captured_vars, inner_expr = reward_expr.args
+        if len(captured_vars) != 1:
+            raise ValueError(
+                f'reward-vector requirement expects exactly one captured variable '
+                f'(the agent), but got {len(captured_vars)}.')
+
+        # captured_vars structure: [('typed_var', (var_name, var_type))]
+        # Extract the variable name and type from the nested structure
+        _, (agent_var, agent_type) = captured_vars[0]
+        self._per_agent_reward_expr = inner_expr
+        self._agent_var = agent_var
+        self._agent_type = agent_type
+
+        # Get the actual agent objects for this type
+        # type_to_objects maps type names (strings) to lists of objects
+        self._agents = self.rddl.type_to_objects.get(agent_type, [])
+
     def seed(self, seed: int) -> None:
         '''Sets the pseudo-random RNG seed for generating random numbers.
-        
+
         :param seed: seed value to use for all future simulations
         '''
         self.rng = np.random.default_rng(seed)
-        
+
     def _compile(self):
         rddl = self.rddl
-        
+
         # compile initial values
         initializer = RDDLValueInitializer(rddl, logger=self.logger)
         self.init_values = initializer.initialize()
-        
+
         # compute dependency graph for CPFs and sort them by evaluation order
-        sorter = RDDLLevelAnalysis(rddl, 
-                                   allow_synchronous_state=self.allow_synchronous_state, 
+        sorter = RDDLLevelAnalysis(rddl,
+                                   allow_synchronous_state=self.allow_synchronous_state,
                                    logger=self.logger)
-        self.levels = sorter.compute_levels()      
-        self.cpfs = []  
+        self.levels = sorter.compute_levels()
+        self.cpfs = []
         for cpfs in self.levels.values():
             for cpf in cpfs:
                 _, expr = rddl.cpfs[cpf]
@@ -152,26 +192,26 @@ class RDDLSimulator:
                 dtype = RDDLValueInitializer.NUMPY_TYPES.get(
                     prange, RDDLValueInitializer.INT)
                 self.cpfs.append((cpf, expr, dtype))
-                
+
         # trace expressions to cache information to be used later
         tracer = RDDLObjectsTracer(rddl, logger=self.logger, cpf_levels=self.levels)
         self.traced = tracer.trace()
-        
-        # initialize all fluent and non-fluent values        
+
+        # initialize all fluent and non-fluent values
         self.subs = self.init_values.copy()
-        self.state = None  
+        self.state = None
         self.noop_actions = {var: values
                              for (var, values) in self.init_values.items()
                              if rddl.variable_types[var] == 'action-fluent'}
         self.grounded_noop_actions = rddl.ground_vars_with_values(self.noop_actions)
         self.grounded_action_ranges = rddl.ground_vars_with_value(rddl.action_ranges)
         self._pomdp = bool(rddl.observ_fluents)
-        
+
         # cached for performance
-        self.invariant_names = [f'Invariant {i}' for i in range(len(rddl.invariants))]        
+        self.invariant_names = [f'Invariant {i}' for i in range(len(rddl.invariants))]
         self.precond_names = [f'Precondition {i}' for i in range(len(rddl.preconditions))]
-        self.terminal_names = [f'Termination {i}' for i in range(len(rddl.terminations))]        
-        
+        self.terminal_names = [f'Termination {i}' for i in range(len(rddl.terminations))]
+
     @property
     def states(self) -> Args:
         return self.state.copy()
@@ -179,11 +219,11 @@ class RDDLSimulator:
     @property
     def is_pomdp(self) -> bool:
         return self._pomdp
-    
+
     # ===========================================================================
     # error checks
     # ===========================================================================
-    
+
     @staticmethod
     def _check_type(value, valid, msg, expr, arg=None):
         if not np.can_cast(np.atleast_1d(value), valid):
@@ -196,7 +236,7 @@ class RDDLSimulator:
                 raise RDDLTypeError(
                     f'Argument {arg} of {msg} must evaluate to {valid}, '
                     f'got {value} of type {dtype}.\n' + print_stack_trace(expr))
-    
+
     @staticmethod
     def _check_types(value, valid, msg, expr):
         for valid_type in valid:
@@ -206,7 +246,7 @@ class RDDLSimulator:
         raise RDDLTypeError(
             f'{msg} must evaluate to one of {valid}, '
             f'got {value} of type {dtype}.\n' + print_stack_trace(expr))
-    
+
     @staticmethod
     def _check_op(op, valid, msg, expr):
         numpy_op = valid.get(op, None)
@@ -215,64 +255,64 @@ class RDDLSimulator:
                 f'{msg} operator {op} is not supported: '
                 f'must be in {set(valid.keys())}.\n' + print_stack_trace(expr))
         return numpy_op
-        
+
     @staticmethod
     def _check_arity(args, required, msg, expr):
         if len(args) != required:
             raise RDDLInvalidNumberOfArgumentsError(
-                f'{msg} requires {required} argument(s), got {len(args)}.\n' + 
+                f'{msg} requires {required} argument(s), got {len(args)}.\n' +
                 print_stack_trace(expr))
-    
+
     @staticmethod
     def _check_positive(value, strict, msg, expr):
         if strict and not np.all(value > 0):
             raise RDDLValueOutOfRangeError(
-                f'{msg} must be positive, got {value}.\n' + 
+                f'{msg} must be positive, got {value}.\n' +
                 print_stack_trace(expr))
         elif not strict and not np.all(value >= 0):
             raise RDDLValueOutOfRangeError(
-                f'{msg} must be non-negative, got {value}.\n' + 
+                f'{msg} must be non-negative, got {value}.\n' +
                 print_stack_trace(expr))
-    
+
     @staticmethod
     def _check_bounds(lb, ub, msg, expr):
         if not np.all(lb <= ub):
             raise RDDLValueOutOfRangeError(
-                f'Bounds of {msg} are invalid:' 
-                f'max value {ub} must be >= min value {lb}.\n' + 
+                f'Bounds of {msg} are invalid:'
+                f'max value {ub} must be >= min value {lb}.\n' +
                 print_stack_trace(expr))
-            
+
     @staticmethod
     def _check_range(value, lb, ub, msg, expr):
         if not np.all(np.logical_and(value >= lb, value <= ub)):
             raise RDDLValueOutOfRangeError(
-                f'{msg} must be in the range [{lb}, {ub}], got {value}.\n' + 
+                f'{msg} must be in the range [{lb}, {ub}], got {value}.\n' +
                 print_stack_trace(expr))
-    
+
     # ===========================================================================
     # main sampling routines
     # ===========================================================================
-    
+
     def prepare_actions_for_sim(self, actions: Args) -> Args:
         '''Prepares action dictionary for the vectorized format required by the simulator.'''
         rddl = self.rddl
-        
-        sim_actions = {action: np.copy(value) 
+
+        sim_actions = {action: np.copy(value)
                        for (action, value) in self.noop_actions.items()}
-        for (action, value) in actions.items(): 
+        for (action, value) in actions.items():
 
             # get lifted action name
             objects = []
             ground_action = action
             if action not in sim_actions:
                 action, objects = RDDLPlanningModel.parse_grounded(action)
-            
+
             # check that the action is valid
             if action not in sim_actions:
                 raise RDDLInvalidActionError(
-                    f'<{action}> is not a valid action-fluent, ' 
+                    f'<{action}> is not a valid action-fluent, '
                     f'must be one of {set(sim_actions.keys())}.')
-            
+
             # boolean fix
             ptype = rddl.action_ranges[action]
             if ptype == 'bool':
@@ -280,7 +320,7 @@ class RDDLSimulator:
                     value = np.asarray(value, dtype=bool)
                 else:
                     value = bool(value)
-            
+
             # grounded assignment
             if objects:
                 if np.shape(value):
@@ -296,22 +336,22 @@ class RDDLSimulator:
                     raise RDDLInvalidActionError(
                         f'Grounded action-fluent name <{ground_action}> '
                         f'requires {np.ndim(tensor)} parameters, got {len(indices)}.')
-                tensor[indices] = value 
-            
+                tensor[indices] = value
+
             # vectorized assignment
             else:
                 tensor = sim_actions[action]
                 if np.shape(value) != np.shape(tensor):
                     raise RDDLInvalidActionError(
                         f'Value array for action-fluent <{action}> must be of shape '
-                        f'{np.shape(tensor)}, got array of shape {np.shape(value)}.')      
+                        f'{np.shape(tensor)}, got array of shape {np.shape(value)}.')
                 if np.asarray(value).dtype.type is np.str_:
                     value = rddl.object_string_to_index_array(ptype, value)
                 RDDLSimulator._check_type(value, np.asarray(tensor).dtype, action, expr='')
                 sim_actions[action] = value
 
         # check action ranges for enum valued
-        for (action, value) in sim_actions.items(): 
+        for (action, value) in sim_actions.items():
             ptype = rddl.action_ranges[action]
             if ptype not in RDDLValueInitializer.NUMPY_TYPES:
                 max_index = len(rddl.type_to_objects[ptype]) - 1
@@ -322,23 +362,23 @@ class RDDLSimulator:
                         f'are not valid, must be in the range [0, {max_index}].')
 
         return sim_actions
-    
-    def check_default_action_count(self, actions: Args, 
+
+    def check_default_action_count(self, actions: Args,
                                    enforce_for_non_bool: bool=True) -> None:
-        '''Throws an exception if the actions do not satisfy max-nondef-actions.'''     
+        '''Throws an exception if the actions do not satisfy max-nondef-actions.'''
         action_ranges = self.rddl.action_ranges
         noop_actions = self.noop_actions
-            
+
         total_non_default = 0
         for (var, values) in actions.items():
-            
+
             # check that action is valid
             prange = action_ranges.get(var, None)
             if prange is None:
                 raise RDDLInvalidActionError(
                     f'<{var}> is not a valid action-fluent, '
                     f'must be one of {set(action_ranges.keys())}.')
-            
+
             # check that action shape is valid
             default_values = noop_actions[var]
             if np.shape(values) != np.shape(default_values):
@@ -346,16 +386,16 @@ class RDDLSimulator:
                     f'Value array for action-fluent <{var}> must be of shape '
                     f'{np.shape(default_values)}, got array of shape '
                     f'{np.shape(values)}.')
-            
+
             # accumulate count of non-default actions
             if enforce_for_non_bool or prange == 'bool':
                 total_non_default += np.count_nonzero(values != default_values)
-        
+
         if total_non_default > self.rddl.max_allowed_actions:
             raise RDDLInvalidActionError(
                 f'Expected at most {self.rddl.max_allowed_actions} '
                 f'non-default actions, got {total_non_default}.')
-        
+
     def check_state_invariants(self, silent: bool=False) -> bool:
         '''Throws an exception if the state invariants are not satisfied.'''
         for (i, invariant) in enumerate(self.rddl.invariants):
@@ -368,11 +408,11 @@ class RDDLSimulator:
                         f'{loc} is not satisfied.\n' + print_stack_trace(invariant))
                 return False
         return True
-    
+
     def check_action_preconditions(self, actions: Args, silent: bool=False) -> bool:
-        '''Throws an exception if the action preconditions are not satisfied.'''  
+        '''Throws an exception if the action preconditions are not satisfied.'''
         self.subs.update(actions)
-        
+
         for (i, precond) in enumerate(self.rddl.preconditions):
             loc = self.precond_names[i]
             sample = self._sample(precond, self.subs)
@@ -380,11 +420,11 @@ class RDDLSimulator:
             if not bool(sample):
                 if not silent:
                     raise RDDLActionPreconditionNotSatisfiedError(
-                        f'{loc} is not satisfied for actions {actions}.\n' + 
+                        f'{loc} is not satisfied for actions {actions}.\n' +
                         print_stack_trace(precond))
                 return False
         return True
-    
+
     def check_terminal_states(self) -> bool:
         '''Return True if a terminal state has been reached.'''
         for (i, terminal) in enumerate(self.rddl.terminations):
@@ -394,21 +434,44 @@ class RDDLSimulator:
             if bool(sample):
                 return True
         return False
-    
-    def sample_reward(self) -> float:
-        '''Samples the current reward given the current state and action.'''
-        return float(self._sample(self.rddl.reward, self.subs))
-    
+
+    def sample_reward(self) -> Union[float, np.ndarray]:
+        '''Samples the current reward given the current state and action.
+
+        Returns:
+            float or np.ndarray: Reward value. Returns array of per-agent rewards
+                                if reward-vector requirement is specified,
+                                otherwise returns scalar float.
+        '''
+        if self.keep_reward_as_array:
+            # Evaluate the inner per-agent reward expression
+            # This will return an array with one reward per agent
+            all_agent_rewards = self._sample(self._per_agent_reward_expr, self.subs)
+
+            # Convert to 1D array of floats
+            if isinstance(all_agent_rewards, np.ndarray):
+                all_agent_rewards = all_agent_rewards.astype(np.float32)
+                # Ensure it's 1D
+                all_agent_rewards = all_agent_rewards.flatten()
+            else:
+                # Single value - wrap in array
+                all_agent_rewards = np.array([float(all_agent_rewards)], dtype=np.float32)
+
+            return all_agent_rewards
+        else:
+            reward = self._sample(self.rddl.reward, self.subs)
+            return float(reward)
+
     def reset(self) -> Union[Dict[str, None], Args]:
         '''Resets the state variables to their initial values.'''
         rddl = self.rddl
         subs = self.subs = self.init_values.copy()
         keep_tensors = self.keep_tensors
-        
+
         # update state
         self.state = {}
         for state in rddl.state_fluents:
-            
+
             # convert object integer to string representation
             state_values = subs[state]
             if self.objects_as_strings:
@@ -421,7 +484,7 @@ class RDDLSimulator:
                 self.state[state] = state_values
             else:
                 self.state.update(rddl.ground_var_with_values(state, state_values))
-        
+
         # update observation
         if self._pomdp:
             if keep_tensors:
@@ -432,29 +495,29 @@ class RDDLSimulator:
                     obs.update(rddl.ground_var_with_value(var, None))
         else:
             obs = self.state
-        
+
         done = self.check_terminal_states()
         return obs, done
-    
+
     def step(self, actions: Args) -> Args:
         '''Samples and returns the next state from the CPF expressions.
-        
+
         :param actions: a dict mapping current action fluent to their values
         '''
         rddl = self.rddl
         keep_tensors = self.keep_tensors
         subs = self.subs
         subs.update(actions)
-        
+
         # evaluate CPFs in topological order
         for (cpf, expr, dtype) in self.cpfs:
             sample = self._sample(expr, subs)
             RDDLSimulator._check_type(sample, dtype, cpf, expr)
             subs[cpf] = sample
-        
+
         # evaluate reward
         reward = self.sample_reward()
-        
+
         # update state
         self.state = {}
         for (state, next_state) in rddl.next_state.items():
@@ -474,9 +537,9 @@ class RDDLSimulator:
                 self.state[state] = state_values
             else:
                 self.state.update(rddl.ground_var_with_values(state, state_values))
-        
+
         # update observation
-        if self._pomdp: 
+        if self._pomdp:
             obs = {}
             for var in rddl.observ_fluents:
 
@@ -487,21 +550,21 @@ class RDDLSimulator:
                     if ptype not in RDDLValueInitializer.NUMPY_TYPES:
                         obs_values = rddl.index_to_object_string_array(ptype, obs_values)
 
-                # optional grounding of observ-fluent dictionary    
+                # optional grounding of observ-fluent dictionary
                 if keep_tensors:
                     obs[var] = obs_values
                 else:
                     obs.update(rddl.ground_var_with_values(var, obs_values))
         else:
             obs = self.state
-        
-        done = self.check_terminal_states()        
+
+        done = self.check_terminal_states()
         return obs, reward, done
-        
+
     # ===========================================================================
     # start of sampling subroutines
     # ===========================================================================
-    
+
     def _sample(self, expr, subs):
         etype, _ = expr.etype
         if etype == 'constant':
@@ -530,35 +593,35 @@ class RDDLSimulator:
             return self._sample_matrix(expr, subs)
         else:
             raise RDDLNotImplementedError(
-                f'Internal error: expression type {etype} is not supported.\n' + 
+                f'Internal error: expression type {etype} is not supported.\n' +
                 print_stack_trace(expr))
-                
+
     # ===========================================================================
     # leaves
     # ===========================================================================
-        
+
     def _sample_constant(self, expr, _):
         return self.traced.cached_sim_info(expr)
-    
+
     def _sample_pvar(self, expr, subs):
         var, args = expr.args
-        
+
         # free variable (e.g., ?x) and object converted to canonical index
         is_value, cached_info = self.traced.cached_sim_info(expr)
         if is_value:
             return cached_info
-        
+
         # extract variable value
         sample = subs.get(var, None)
         if sample is None:
             raise RDDLUndefinedVariableError(
-                f'Variable <{var}> is referenced before assignment.\n' + 
+                f'Variable <{var}> is referenced before assignment.\n' +
                 print_stack_trace(expr))
-        
+
         # lifted domain must slice and/or reshape value tensor
         if cached_info is not None:
             slices, axis, shape, op_code, op_args = cached_info
-            if slices: 
+            if slices:
                 if op_code == RDDLObjectsTracer.NUMPY_OP_CODE.NESTED_SLICE:
                     slices = tuple(
                         (self._sample(arg, subs) if _slice is None else _slice)
@@ -573,24 +636,24 @@ class RDDLSimulator:
             elif op_code == RDDLObjectsTracer.NUMPY_OP_CODE.TRANSPOSE:
                 sample = np.transpose(sample, axes=op_args)
         return sample
-    
+
     # ===========================================================================
     # arithmetic
     # ===========================================================================
-    
+
     def _sample_arithmetic(self, expr, subs):
         _, op = expr.etype
         numpy_op = RDDLSimulator._check_op(
             op, self.ARITHMETIC_OPS, 'Arithmetic', expr)
-        
-        args = expr.args        
+
+        args = expr.args
         n = len(args)
-        
+
         # unary negation
         if n == 1 and op == '-':
             arg, = args
             return -1 * self._sample(arg, subs)
-        
+
         # binary operator: for * try to short-circuit if possible
         elif n == 2:
             lhs, rhs = args
@@ -604,88 +667,88 @@ class RDDLSimulator:
                 except:
                     raise ArithmeticError(
                         f'Can not evaluate arithmetic operation {op} '
-                        f'at {sample_lhs} and {sample_rhs}.\n' + 
+                        f'at {sample_lhs} and {sample_rhs}.\n' +
                         print_stack_trace(expr))
-        
+
         # for a grounded domain can short-circuit * and +
         elif n > 0 and not self.traced.cached_objects_in_scope(expr):
             if op == '*':
                 return self._sample_product_grounded(args, subs)
             elif op == '+':
                 return sum(1 * self._sample(arg, subs) for arg in args)
-        
+
         raise RDDLInvalidNumberOfArgumentsError(
             f'Arithmetic operator {op} does not have the required '
             f'number of arguments.\n' + print_stack_trace(expr))
-    
+
     def _sample_product(self, lhs, rhs, subs):
-        
+
         # prioritize simple expressions
         if rhs.is_constant_expression() or rhs.is_pvariable_expression():
             lhs, rhs = rhs, lhs
-            
+
         sample_lhs = 1 * self._sample(lhs, subs)
-        
+
         # short circuit if all zero
         if not np.any(sample_lhs):
             return sample_lhs
-            
+
         sample_rhs = self._sample(rhs, subs)
         return sample_lhs * sample_rhs
-    
+
     def _sample_product_grounded(self, args, subs):
         prod = 1
-        
+
         # go through simple expressions first
-        for arg in args: 
+        for arg in args:
             if arg.is_constant_expression() or arg.is_pvariable_expression():
                 sample = self._sample(arg, subs)
                 prod *= sample
                 if prod == 0:
                     return prod
-        
+
         # go through complex expressions last
-        for arg in args: 
+        for arg in args:
             if not (arg.is_constant_expression() or arg.is_pvariable_expression()):
                 sample = self._sample(arg, subs)
                 prod *= sample
                 if prod == 0:
                     return prod
-                
+
         return prod
-        
+
     # ===========================================================================
     # boolean
     # ===========================================================================
-    
+
     def _sample_relational(self, expr, subs):
         _, op = expr.etype
         numpy_op = RDDLSimulator._check_op(
             op, self.RELATIONAL_OPS, 'Relational', expr)
-        
+
         args = expr.args
         RDDLSimulator._check_arity(args, 2, op, expr)
-        
+
         lhs, rhs = args
         sample_lhs = 1 * self._sample(lhs, subs)
         sample_rhs = 1 * self._sample(rhs, subs)
         return numpy_op(sample_lhs, sample_rhs)
-    
+
     def _sample_logical(self, expr, subs):
         _, op = expr.etype
         if op == '&':
             op = '^'
         numpy_op = RDDLSimulator._check_op(op, self.LOGICAL_OPS, 'Logical', expr)
-        
+
         args = expr.args
         n = len(args)
-        
+
         if n == 1 and op == '~':
             arg, = args
             sample = self._sample(arg, subs)
             RDDLSimulator._check_type(sample, bool, op, expr, arg='')
             return np.logical_not(sample)
-        
+
         # try to short-circuit ^ and | if possible
         elif n == 2:
             lhs, rhs = args
@@ -697,41 +760,41 @@ class RDDLSimulator:
                 RDDLSimulator._check_type(sample_lhs, bool, op, expr, arg=1)
                 RDDLSimulator._check_type(sample_rhs, bool, op, expr, arg=2)
                 return numpy_op(sample_lhs, sample_rhs)
-        
+
         # for a grounded domain, we can short-circuit ^ and |
         elif n > 0 and (op == '^' or op == '|') \
         and not self.traced.cached_objects_in_scope(expr):
             return self._sample_and_or_grounded(args, op, expr, subs)
-            
+
         raise RDDLInvalidNumberOfArgumentsError(
             f'Logical operator {op} does not have the required '
             f'number of arguments.\n' + print_stack_trace(expr))
-    
+
     def _sample_and_or(self, lhs, rhs, op, expr, subs):
-        
+
         # prioritize simple expressions
         if rhs.is_constant_expression() or rhs.is_pvariable_expression():
-            lhs, rhs = rhs, lhs 
-            
+            lhs, rhs = rhs, lhs
+
         sample_lhs = self._sample(lhs, subs)
         RDDLSimulator._check_type(sample_lhs, bool, op, expr, arg=1)
-        
+
         # short-circuit if all True/False
         if (op == '^' and not np.any(sample_lhs)) \
         or (op == '|' and np.all(sample_lhs)):
             return sample_lhs
-            
+
         sample_rhs = self._sample(rhs, subs)
         RDDLSimulator._check_type(sample_rhs, bool, op, expr, arg=2)
-        
+
         if op == '^':
             return np.logical_and(sample_lhs, sample_rhs)
         else:
             return np.logical_or(sample_lhs, sample_rhs)
-    
-    def _sample_and_or_grounded(self, args, op, expr, subs): 
+
+    def _sample_and_or_grounded(self, args, op, expr, subs):
         use_and = op == '^'
-        
+
         # go through simple expressions first
         for (i, arg) in enumerate(args):
             if arg.is_constant_expression() or arg.is_pvariable_expression():
@@ -742,7 +805,7 @@ class RDDLSimulator:
                     return False
                 elif not use_and and sample:
                     return True
-        
+
         # go through complex expressions last
         for (i, arg) in enumerate(args):
             if not (arg.is_constant_expression() or arg.is_pvariable_expression()):
@@ -753,36 +816,36 @@ class RDDLSimulator:
                     return False
                 elif not use_and and sample:
                     return True
-            
+
         return use_and
-            
+
     # ===========================================================================
     # aggregation
     # ===========================================================================
-    
+
     def _sample_aggregation(self, expr, subs):
         _, op = expr.etype
         numpy_op = RDDLSimulator._check_op(
             op, self.AGGREGATION_OPS, 'Aggregation', expr)
-        
+
         # sample the argument and aggregate over the reduced axes
         * _, arg = expr.args
-        sample = self._sample(arg, subs)                
+        sample = self._sample(arg, subs)
         if op in self.AGGREGATION_BOOL:
             RDDLSimulator._check_type(sample, bool, op, expr, arg='')
         else:
             sample = 1 * sample
         _, axes = self.traced.cached_sim_info(expr)
         return numpy_op(sample, axis=axes)
-     
+
     # ===========================================================================
     # function
     # ===========================================================================
-    
+
     def _sample_func(self, expr, subs):
         _, name = expr.etype
         args = expr.args
-        
+
         # unary function
         unary_op = self.UNARY.get(name, None)
         if unary_op is not None:
@@ -793,9 +856,9 @@ class RDDLSimulator:
                 return unary_op(sample)
             except:
                 raise ArithmeticError(
-                    f'Can not evaluate unary function {name} at {sample}.\n' + 
+                    f'Can not evaluate unary function {name} at {sample}.\n' +
                     print_stack_trace(expr))
-        
+
         # binary function
         binary_op = self.BINARY.get(name, None)
         if binary_op is not None:
@@ -814,15 +877,15 @@ class RDDLSimulator:
                 raise ArithmeticError(
                     f'Can not evaluate binary function {name} at '
                     f'{sample_lhs} and {sample_rhs}.\n' + print_stack_trace(expr))
-        
+
         raise RDDLNotImplementedError(
             f'Function {name} is not supported.\n' + print_stack_trace(expr))
-    
+
     def _sample_pyfunc(self, expr, subs):
         _, pyfunc_name = expr.etype
         captured_vars, args = expr.args
         scope_vars = self.traced.cached_objects_in_scope(expr)
-                       
+
         # evaluate inputs to the function
         # first dimensions are non-captured vars in outer scope followed by all the _
         free_vars = [p for p in scope_vars if p[0] not in captured_vars]
@@ -834,7 +897,7 @@ class RDDLSimulator:
             new_shape = (np.prod(shape[:num_free_vars], dtype=int),) + shape[num_free_vars:]
             flat_sample = np.reshape(sample, new_shape)
             flat_samples.append(flat_sample)
-        
+
         # now all the inputs have dimensions equal to (k,) + the number of _ occurences
         # k is the number of possible non-captured object combinations
         # evaluate the function independently for each combination
@@ -844,18 +907,18 @@ class RDDLSimulator:
         if pyfunc is None:
             raise RDDLUndefinedVariableError(
                 f'Undefined external Python function <{pyfunc_name}>, '
-                f'must be one of {list(self.python_functions.keys())}.\n' +  
+                f'must be one of {list(self.python_functions.keys())}.\n' +
                 print_stack_trace(expr))
         output = np.array([pyfunc(*inputs) for inputs in zip(*flat_samples)])
-        
+
         # check the output type is correct
         if not np.issubdtype(output.dtype, np.number) \
         and not np.issubdtype(output.dtype, np.bool_):
             raise ValueError(
                 f'External Python function <{pyfunc_name}> returned array of '
-                f'type {output.dtype}, which is not a primitive type.\n' +  
+                f'type {output.dtype}, which is not a primitive type.\n' +
                 print_stack_trace(expr))
-    
+
         # check the output shape of captured part is correct
         captured_types = [t for (p, t) in scope_vars if p in captured_vars]
         require_dims = self.rddl.object_counts(captured_types)
@@ -864,20 +927,20 @@ class RDDLSimulator:
             raise ValueError(
                 f'External Python function <{pyfunc_name}> returned array with '
                 f'{len(pyfunc_dims)} dimensions, which does not match the '
-                f'number of captured parameter(s) {len(require_dims)}.\n' +  
+                f'number of captured parameter(s) {len(require_dims)}.\n' +
                 print_stack_trace(expr))
         for (param, require_dim, actual_dim) in zip(captured_vars, require_dims, pyfunc_dims):
             if require_dim != actual_dim:
                 raise ValueError(
                     f'External Python function <{pyfunc_name}> returned array with '
                     f'{actual_dim} elements for captured parameter <{param}>, '
-                    f'which does not match the number of objects {require_dim}.\n' + 
+                    f'which does not match the number of objects {require_dim}.\n' +
                     print_stack_trace(expr))
 
         # unravel the combinations k back into their original dimensions
         free_dims = self.rddl.object_counts(p for (_, p) in free_vars)
         output = np.reshape(output, free_dims + pyfunc_dims)
-        
+
         # rearrange the output dimensions to match the outer scope
         source_indices = len(free_dims) + np.arange(len(pyfunc_dims), dtype=int)
         dest_indices = self.traced.cached_sim_info(expr)
@@ -887,30 +950,30 @@ class RDDLSimulator:
     # ===========================================================================
     # control flow
     # ===========================================================================
-    
+
     def _sample_control(self, expr, subs):
         _, op = expr.etype
         RDDLSimulator._check_op(op, self.CONTROL_OPS, 'Control', expr)
-        
+
         if op == 'if':
             return self._sample_if(expr, subs)
         else:
-            return self._sample_switch(expr, subs)    
-        
+            return self._sample_switch(expr, subs)
+
     def _sample_if(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 3, 'If then else', expr)
-        
+
         pred, arg1, arg2 = args
         sample_pred = self._sample(pred, subs)
         RDDLSimulator._check_type(sample_pred, bool, 'If predicate', expr)
-        
+
         # can short circuit if all elements of predicate tensor equal
-        first_elem = bool(sample_pred.flat[0] 
-                          if self.traced.cached_objects_in_scope(expr) 
+        first_elem = bool(sample_pred.flat[0]
+                          if self.traced.cached_objects_in_scope(expr)
                           else sample_pred)
         all_equal = np.all(sample_pred == first_elem)
-        
+
         if all_equal:
             arg = arg1 if first_elem else arg2
             return self._sample(arg, subs)
@@ -918,44 +981,44 @@ class RDDLSimulator:
             sample_then = self._sample(arg1, subs)
             sample_else = self._sample(arg2, subs)
             return np.where(sample_pred, sample_then, sample_else)
-    
+
     def _sample_switch(self, expr, subs):
-        pred, *_ = expr.args             
+        pred, *_ = expr.args
         sample_pred = self._sample(pred, subs)
         RDDLSimulator._check_type(
             sample_pred, RDDLValueInitializer.INT, 'Switch predicate', expr)
-        
+
         # can short circuit if all elements of predicate tensor equal
-        cases, default = self.traced.cached_sim_info(expr)  
-        first_elem = bool(sample_pred.flat[0] 
-                          if self.traced.cached_objects_in_scope(expr) 
+        cases, default = self.traced.cached_sim_info(expr)
+        first_elem = bool(sample_pred.flat[0]
+                          if self.traced.cached_objects_in_scope(expr)
                           else sample_pred)
         all_equal = np.all(sample_pred == first_elem)
-        
+
         if all_equal:
             arg = cases[first_elem]
             if arg is None:
                 arg = default
-            return self._sample(arg, subs)        
-        else: 
+            return self._sample(arg, subs)
+        else:
             sample_def = None if default is None else self._sample(default, subs)
             sample_cases = np.asarray([
                 (sample_def if arg is None else self._sample(arg, subs))
                 for arg in cases
             ])
             sample_pred = np.asarray(sample_pred)[np.newaxis, ...]
-            sample = np.take_along_axis(sample_cases, sample_pred, axis=0)   
+            sample = np.take_along_axis(sample_cases, sample_pred, axis=0)
             assert sample.shape[0] == 1
             return sample[0, ...]
-        
+
     # ===========================================================================
     # random variables
     # ===========================================================================
-    
+
     def _sample_random(self, expr, subs):
         _, name = expr.etype
         if name == 'KronDelta':
-            return self._sample_kron_delta(expr, subs)        
+            return self._sample_kron_delta(expr, subs)
         elif name == 'DiracDelta':
             return self._sample_dirac_delta(expr, subs)
         elif name == 'Uniform':
@@ -969,7 +1032,7 @@ class RDDLSimulator:
         elif name == 'Exponential':
             return self._sample_exponential(expr, subs)
         elif name == 'Weibull':
-            return self._sample_weibull(expr, subs)        
+            return self._sample_weibull(expr, subs)
         elif name == 'Gamma':
             return self._sample_gamma(expr, subs)
         elif name == 'Binomial':
@@ -1006,29 +1069,29 @@ class RDDLSimulator:
             return self._sample_discrete_pvar(expr, subs, unnorm=True)
         else:
             raise RDDLNotImplementedError(
-                f'Distribution {name} is not supported.\n' + 
+                f'Distribution {name} is not supported.\n' +
                 print_stack_trace(expr))
 
     def _sample_kron_delta(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 1, 'KronDelta', expr)
-        
+
         arg, = args
         sample = self._sample(arg, subs)
         RDDLSimulator._check_types(
             sample, (bool, RDDLValueInitializer.INT), 'Argument of KronDelta', expr)
         return sample
-    
+
     def _sample_dirac_delta(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 1, 'DiracDelta', expr)
-        
+
         arg, = args
         sample = self._sample(arg, subs)
         RDDLSimulator._check_type(
-            sample, RDDLValueInitializer.REAL, 'Argument of DiracDelta', expr)        
+            sample, RDDLValueInitializer.REAL, 'Argument of DiracDelta', expr)
         return sample
-    
+
     def _sample_uniform(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Uniform', expr)
@@ -1037,73 +1100,73 @@ class RDDLSimulator:
         sample_lb = self._sample(lb, subs)
         sample_ub = self._sample(ub, subs)
         RDDLSimulator._check_bounds(sample_lb, sample_ub, 'Uniform', expr)
-        return self.rng.uniform(low=sample_lb, high=sample_ub)      
-    
+        return self.rng.uniform(low=sample_lb, high=sample_ub)
+
     def _sample_bernoulli(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 1, 'Bernoulli', expr)
-        
+
         pr, = args
         sample_pr = self._sample(pr, subs)
         RDDLSimulator._check_range(sample_pr, 0, 1, 'Bernoulli p', expr)
         size = sample_pr.shape if self.traced.cached_objects_in_scope(expr) else None
         return self.rng.uniform(size=size) <= sample_pr
-    
+
     def _sample_normal(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Normal', expr)
-        
+
         mean, var = args
         sample_mean = self._sample(mean, subs)
         sample_var = self._sample(var, subs)
-        RDDLSimulator._check_positive(sample_var, False, 'Normal variance', expr)  
+        RDDLSimulator._check_positive(sample_var, False, 'Normal variance', expr)
         sample_std = np.sqrt(sample_var)
         return self.rng.normal(loc=sample_mean, scale=sample_std)
-    
+
     def _sample_poisson(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 1, 'Poisson', expr)
-        
+
         rate, = args
         sample_rate = self._sample(rate, subs)
-        RDDLSimulator._check_positive(sample_rate, False, 'Poisson rate', expr)        
+        RDDLSimulator._check_positive(sample_rate, False, 'Poisson rate', expr)
         return self.rng.poisson(lam=sample_rate)
-    
+
     def _sample_exponential(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 1, 'Exponential', expr)
-        
+
         scale, = expr.args
         sample_scale = self._sample(scale, subs)
         RDDLSimulator._check_positive(sample_scale, True, 'Exponential rate', expr)
         return self.rng.exponential(scale=sample_scale)
-    
+
     def _sample_weibull(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Weibull', expr)
-        
+
         shape, scale = args
         sample_shape = self._sample(shape, subs)
         sample_scale = self._sample(scale, subs)
         RDDLSimulator._check_positive(sample_shape, True, 'Weibull shape', expr)
         RDDLSimulator._check_positive(sample_scale, True, 'Weibull scale', expr)
         return sample_scale * self.rng.weibull(a=sample_shape)
-    
+
     def _sample_gamma(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Gamma', expr)
-        
+
         shape, scale = args
         sample_shape = self._sample(shape, subs)
         sample_scale = self._sample(scale, subs)
-        RDDLSimulator._check_positive(sample_shape, True, 'Gamma shape', expr)            
-        RDDLSimulator._check_positive(sample_scale, True, 'Gamma scale', expr)        
+        RDDLSimulator._check_positive(sample_shape, True, 'Gamma shape', expr)
+        RDDLSimulator._check_positive(sample_scale, True, 'Gamma scale', expr)
         return self.rng.gamma(shape=sample_shape, scale=sample_scale)
-    
+
     def _sample_binomial(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Binomial', expr)
-        
+
         count, pr = args
         sample_count = self._sample(count, subs)
         sample_pr = self._sample(pr, subs)
@@ -1111,82 +1174,82 @@ class RDDLSimulator:
         RDDLSimulator._check_positive(sample_count, False, 'Binomial count', expr)
         RDDLSimulator._check_range(sample_pr, 0, 1, 'Binomial p', expr)
         return self.rng.binomial(n=sample_count, p=sample_pr)
-    
+
     def _sample_negative_binomial(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'NegativeBinomial', expr)
-        
+
         count, pr = args
         sample_count = self._sample(count, subs)
         sample_pr = self._sample(pr, subs)
         RDDLSimulator._check_positive(sample_count, True, 'NegativeBinomial r', expr)
-        RDDLSimulator._check_range(sample_pr, 0, 1, 'NegativeBinomial p', expr)        
+        RDDLSimulator._check_range(sample_pr, 0, 1, 'NegativeBinomial p', expr)
         return self.rng.negative_binomial(n=sample_count, p=sample_pr)
-    
+
     def _sample_beta(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Beta', expr)
-        
+
         shape, rate = args
         sample_shape = self._sample(shape, subs)
         sample_rate = self._sample(rate, subs)
         RDDLSimulator._check_positive(sample_shape, True, 'Beta shape', expr)
-        RDDLSimulator._check_positive(sample_rate, True, 'Beta rate', expr)        
+        RDDLSimulator._check_positive(sample_rate, True, 'Beta rate', expr)
         return self.rng.beta(a=sample_shape, b=sample_rate)
 
     def _sample_geometric(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 1, 'Geometric', expr)
-        
+
         pr, = args
         sample_pr = self._sample(pr, subs)
-        RDDLSimulator._check_range(sample_pr, 0, 1, 'Geometric p', expr)        
+        RDDLSimulator._check_range(sample_pr, 0, 1, 'Geometric p', expr)
         return self.rng.geometric(p=sample_pr)
-    
+
     def _sample_pareto(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Pareto', expr)
-        
+
         shape, scale = args
         sample_shape = self._sample(shape, subs)
         sample_scale = self._sample(scale, subs)
-        RDDLSimulator._check_positive(sample_shape, True, 'Pareto shape', expr)        
-        RDDLSimulator._check_positive(sample_scale, True, 'Pareto scale', expr)        
+        RDDLSimulator._check_positive(sample_shape, True, 'Pareto shape', expr)
+        RDDLSimulator._check_positive(sample_scale, True, 'Pareto scale', expr)
         return sample_scale * self.rng.pareto(a=sample_shape)
-    
+
     def _sample_student(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 1, 'Student', expr)
-        
+
         df, = args
         sample_df = self._sample(df, subs)
-        RDDLSimulator._check_positive(sample_df, True, 'Student df', expr)            
+        RDDLSimulator._check_positive(sample_df, True, 'Student df', expr)
         return self.rng.standard_t(df=sample_df)
 
     def _sample_gumbel(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Gumbel', expr)
-        
+
         mean, scale = args
         sample_mean = self._sample(mean, subs)
         sample_scale = self._sample(scale, subs)
         RDDLSimulator._check_positive(sample_scale, True, 'Gumbel scale', expr)
         return self.rng.gumbel(loc=sample_mean, scale=sample_scale)
-    
+
     def _sample_laplace(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Laplace', expr)
-        
+
         mean, scale = args
         sample_mean = self._sample(mean, subs)
         sample_scale = self._sample(scale, subs)
         RDDLSimulator._check_positive(sample_scale, True, 'Laplace scale', expr)
         return self.rng.laplace(loc=sample_mean, scale=sample_scale)
-    
+
     def _sample_cauchy(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Cauchy', expr)
-        
+
         mean, scale = args
         sample_mean = self._sample(mean, subs)
         sample_scale = self._sample(scale, subs)
@@ -1194,11 +1257,11 @@ class RDDLSimulator:
         size = sample_mean.shape if self.traced.cached_objects_in_scope(expr) else None
         cauchy01 = self.rng.standard_cauchy(size=size)
         return sample_mean + sample_scale * cauchy01
-    
+
     def _sample_gompertz(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Gompertz', expr)
-        
+
         shape, scale = args
         sample_shape = self._sample(shape, subs)
         sample_scale = self._sample(scale, subs)
@@ -1207,20 +1270,20 @@ class RDDLSimulator:
         size = sample_shape.shape if self.traced.cached_objects_in_scope(expr) else None
         U = self.rng.uniform(size=size)
         return np.log(1.0 - np.log1p(-U) / sample_shape) / sample_scale
-    
+
     def _sample_chisquare(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 1, 'ChiSquare', expr)
-        
+
         df, = args
         sample_df = self._sample(df, subs)
         RDDLSimulator._check_positive(sample_df, True, 'ChiSquare df', expr)
         return self.rng.chisquare(df=sample_df)
-    
+
     def _sample_kumaraswamy(self, expr, subs):
         args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Kumaraswamy', expr)
-        
+
         a, b = args
         sample_a = self._sample(a, subs)
         sample_b = self._sample(b, subs)
@@ -1229,45 +1292,45 @@ class RDDLSimulator:
         size = sample_a.shape if self.traced.cached_objects_in_scope(expr) else None
         U = self.rng.uniform(size=size)
         return (1.0 - U ** (1.0 / sample_b)) ** (1.0 / sample_a)
-    
+
     # ===========================================================================
     # random variables with enum support
     # ===========================================================================
-    
+
     def _sample_discrete_helper(self, pdf, unnorm, expr):
         RDDLSimulator._check_positive(pdf, False, 'Discrete probabilities', expr)
-        
-        # calculate CDF       
+
+        # calculate CDF
         cdf = np.cumsum(pdf, axis=-1)
         if unnorm:
             cdf = cdf / cdf[..., -1:]
-            
+
         # check valid CDF - still do this for unnorm to reject nan values
         if not np.allclose(cdf[..., -1], 1.0):
             raise RDDLValueOutOfRangeError(
-                f'Discrete probabilities must sum to 1, got {cdf[..., -1]}.\n' + 
-                print_stack_trace(expr))     
-        
-        # use inverse CDF sampling                  
+                f'Discrete probabilities must sum to 1, got {cdf[..., -1]}.\n' +
+                print_stack_trace(expr))
+
+        # use inverse CDF sampling
         U = self.rng.random(size=cdf.shape[:-1] + (1,))
         return np.argmax(U < cdf, axis=-1)
-        
+
     def _sample_discrete(self, expr, subs, unnorm):
         sorted_args = self.traced.cached_sim_info(expr)
         samples = [self._sample(arg, subs) for arg in sorted_args]
         pdf = np.stack(samples, axis=-1)
         return self._sample_discrete_helper(pdf, unnorm, expr)
-    
+
     def _sample_discrete_pvar(self, expr, subs, unnorm):
         _, args = expr.args
         arg, = args
         pdf = self._sample(arg, subs)
         return self._sample_discrete_helper(pdf, unnorm, expr)
-               
+
     # ===========================================================================
     # random vectors
     # ===========================================================================
-    
+
     def _sample_random_vector(self, expr, subs):
         _, name = expr.etype
         if name == 'MultivariateNormal':
@@ -1280,17 +1343,17 @@ class RDDLSimulator:
             return self._sample_multinomial(expr, subs)
         else:
             raise RDDLNotImplementedError(
-                f'Multivariate distribution {name} is not supported.\n' + 
+                f'Multivariate distribution {name} is not supported.\n' +
                 print_stack_trace(expr))
-    
+
     def _sample_multivariate_normal(self, expr, subs):
         _, args = expr.args
         RDDLSimulator._check_arity(args, 2, 'MultivariateNormal', expr)
-        
+
         mean, cov = args
         sample_mean = self._sample(mean, subs)
         sample_cov = self._sample(cov, subs)
-        
+
         # reparameterization trick MN(m, LL') = LZ + m, where Z ~ Normal(0, 1)
         L = np.linalg.cholesky(sample_cov)
         Z = self.rng.standard_normal(
@@ -1303,79 +1366,79 @@ class RDDLSimulator:
         index, = self.traced.cached_sim_info(expr)
         sample = np.moveaxis(sample, source=-1, destination=index)
         return sample
-    
+
     def _sample_multivariate_student(self, expr, subs):
         _, args = expr.args
         RDDLSimulator._check_arity(args, 3, 'MultivariateStudent', expr)
-        
+
         mean, cov, df = args
         sample_mean = self._sample(mean, subs)
         sample_cov = self._sample(cov, subs)
         sample_df = self._sample(df, subs)
         RDDLSimulator._check_positive(sample_df, True, 'MultivariateStudent df', expr)
-        
+
         # reparameterization trick MN(m, LL') = LZ + m, where Z ~ StudentT(0, 1)
         sample_df = sample_df[..., np.newaxis, np.newaxis]
         sample_df = np.broadcast_to(sample_df, shape=sample_mean.shape + (1,))
         L = np.linalg.cholesky(sample_cov)
         Z = self.rng.standard_t(df=sample_df)
         sample = np.matmul(L, Z)[..., 0] + sample_mean
-        
+
         # since the sampling is done in the last dimension we need to move it
         # to match the order of the CPF variables
         index, = self.traced.cached_sim_info(expr)
         sample = np.moveaxis(sample, source=-1, destination=index)
         return sample
-    
+
     def _sample_dirichlet(self, expr, subs):
         _, args = expr.args
         RDDLSimulator._check_arity(args, 1, 'Dirichlet', expr)
-        
+
         alpha, = args
         sample_alpha = self._sample(alpha, subs)
-        
+
         # sample Gamma(alpha_i, 1) and normalize across i
         RDDLSimulator._check_positive(sample_alpha, True, 'Dirichlet alpha', expr)
         Gamma = self.rng.gamma(shape=sample_alpha, scale=1.0)
         sample = Gamma / np.sum(Gamma, axis=-1, keepdims=True)
-        
+
         # since the sampling is done in the last dimension we need to move it
         # to match the order of the CPF variables
         index, = self.traced.cached_sim_info(expr)
         sample = np.moveaxis(sample, source=-1, destination=index)
         return sample
-    
+
     def _sample_multinomial(self, expr, subs):
         _, args = expr.args
         RDDLSimulator._check_arity(args, 2, 'Multinomial', expr)
-        
+
         trials, prob = args
-        sample_trials = self._sample(trials, subs) 
-        sample_prob = self._sample(prob, subs)       
+        sample_trials = self._sample(trials, subs)
+        sample_prob = self._sample(prob, subs)
         RDDLSimulator._check_type(sample_trials, RDDLValueInitializer.INT, 'Multinomial trials', expr)
         RDDLSimulator._check_positive(sample_trials, False, 'Multinomial trials', expr)
         RDDLSimulator._check_positive(sample_prob, False, 'Discrete probabilities', expr)
-        
+
         # check valid PMF
         cum_prob = np.sum(sample_prob, axis=-1)
         if not np.allclose(cum_prob, 1.0):
             raise RDDLValueOutOfRangeError(
-                f'Multinomial probabilities must sum to 1, got {cum_prob}.\n' + 
-                print_stack_trace(expr))    
-            
+                f'Multinomial probabilities must sum to 1, got {cum_prob}.\n' +
+                print_stack_trace(expr))
+
         # sample from the multinomial
         sample = self.rng.multinomial(n=sample_trials, pvals=sample_prob)
-        
+
         # since the sampling is done in the last dimension we need to move it
         # to match the order of the CPF variables
         index, = self.traced.cached_sim_info(expr)
         sample = np.moveaxis(sample, source=-1, destination=index)
         return sample
-        
+
     # ===========================================================================
     # matrix algebra
     # ===========================================================================
-    
+
     def _sample_matrix(self, expr, subs):
         _, op = expr.etype
         if op == 'det':
@@ -1388,46 +1451,46 @@ class RDDLSimulator:
             return self._sample_matrix_cholesky(expr, subs)
         else:
             raise RDDLNotImplementedError(
-                f'Matrix operator {op} is not supported.\n' + 
+                f'Matrix operator {op} is not supported.\n' +
                 print_stack_trace(expr))
-    
+
     def _sample_matrix_det(self, expr, subs):
         * _, arg = expr.args
         sample_arg = self._sample(arg, subs)
         return np.linalg.det(sample_arg)
-    
+
     def _sample_matrix_inv(self, expr, subs, pseudo):
         _, arg = expr.args
         sample_arg = self._sample(arg, subs)
         op = np.linalg.pinv if pseudo else np.linalg.inv
         sample = op(sample_arg)
-        
+
         # matrix dimensions are last two axes, move them to the correct position
         indices = self.traced.cached_sim_info(expr)
         sample = np.moveaxis(sample, source=(-2, -1), destination=indices)
-        return sample        
-    
+        return sample
+
     def _sample_matrix_cholesky(self, expr, subs):
         _, arg = expr.args
         sample_arg = self._sample(arg, subs)
         op = np.linalg.cholesky
         sample = op(sample_arg)
-        
+
         # matrix dimensions are last two axes, move them to the correct position
         indices = self.traced.cached_sim_info(expr)
         sample = np.moveaxis(sample, source=(-2, -1), destination=indices)
-        return sample  
-    
-    
+        return sample
+
+
 def lngamma(x):
     xmin = np.min(x)
     if not (xmin > 0):
         raise ValueError(f'Cannot evaluate log-gamma at {xmin}.')
-    
+
     # small x: use lngamma(x) = lngamma(x + m) - ln(x + m - 1)... - ln(x)
     # large x: use asymptotic expansion OEIS:A046969
     if xmin < 7:
-        return lngamma(x + 2) - np.log(x) - np.log(x + 1)        
+        return lngamma(x + 2) - np.log(x) - np.log(x + 1)
     x_squared = x * x
     return (x - 0.5) * np.log(x) - x + 0.5 * np.log(2 * np.pi) + \
         1 / (12 * x) * (
@@ -1440,33 +1503,33 @@ def lngamma(x):
 
 # A container class for compiling a simulator but from external info
 class RDDLSimulatorPrecompiled(RDDLSimulator):
-    
-    def __init__(self, rddl: RDDLPlanningModel, 
-                 init_values: Args, 
-                 levels: Dict[int, Set[str]], 
+
+    def __init__(self, rddl: RDDLPlanningModel,
+                 init_values: Args,
+                 levels: Dict[int, Set[str]],
                  trace_info: object,
                  rng: np.random.Generator=np.random.default_rng(),
-                 keep_tensors: bool=False, 
+                 keep_tensors: bool=False,
                  objects_as_strings: bool=True,
                  python_functions: Optional[Dict[str, Callable]]=None) -> None:
         self.init_values = init_values
         self.levels = levels
         self.traced = trace_info
-        
+
         super(RDDLSimulatorPrecompiled, self).__init__(
-            rddl=rddl, 
+            rddl=rddl,
             allow_synchronous_state=True,
             rng=rng,
             logger=None,
             keep_tensors=keep_tensors,
             objects_as_strings=objects_as_strings,
-            python_functions=python_functions)        
-    
+            python_functions=python_functions)
+
     def _compile(self):
         rddl = self.rddl
-        
-        # compute dependency graph for CPFs and sort them by evaluation order   
-        self.cpfs = []  
+
+        # compute dependency graph for CPFs and sort them by evaluation order
+        self.cpfs = []
         for cpfs in self.levels.values():
             for cpf in cpfs:
                 _, expr = rddl.cpfs[cpf]
@@ -1474,19 +1537,18 @@ class RDDLSimulatorPrecompiled(RDDLSimulator):
                 dtype = RDDLValueInitializer.NUMPY_TYPES.get(
                     prange, RDDLValueInitializer.INT)
                 self.cpfs.append((cpf, expr, dtype))
-                
-        # initialize all fluent and non-fluent values        
+
+        # initialize all fluent and non-fluent values
         self.subs = self.init_values.copy()
-        self.state = None  
+        self.state = None
         self.noop_actions = {var: values
                              for (var, values) in self.init_values.items()
-                             if rddl.variable_types[var] == 'action-fluent'}        
+                             if rddl.variable_types[var] == 'action-fluent'}
         self.grounded_noop_actions = rddl.ground_vars_with_values(self.noop_actions)
         self.grounded_action_ranges = rddl.ground_vars_with_value(rddl.action_ranges)
         self._pomdp = bool(rddl.observ_fluents)
-        
+
         # cached for performance
-        self.invariant_names = [f'Invariant {i}' for i in range(len(rddl.invariants))]        
+        self.invariant_names = [f'Invariant {i}' for i in range(len(rddl.invariants))]
         self.precond_names = [f'Precondition {i}' for i in range(len(rddl.preconditions))]
         self.terminal_names = [f'Termination {i}' for i in range(len(rddl.terminations))]
-        
