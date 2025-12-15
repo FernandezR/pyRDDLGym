@@ -260,6 +260,92 @@ class RDDLEnv(gym.Env):
 
         return obs, reward, terminated, truncated, {}
 
+    def get_available_actions(self) -> Union[List[Any], typing.Dict[str, List]]:
+        """Get valid actions for each agent separately.
+
+        For vectorized (multi-agent) environments, returns a dictionary mapping
+        action fluent names to lists of valid values per agent.
+        For non-vectorized environments, returns a list of valid action values.
+
+        Returns:
+            For vectorized: Dict mapping action names to list of valid value lists per agent
+            For non-vectorized: List of valid action dictionaries
+        """
+        sampler = self.sampler
+
+        if not self.vectorized:
+            # Non-vectorized: enumerate all valid action combinations
+            import itertools
+            valid_actions = []
+            action_possibilities = {}
+
+            for action_name, space in self.action_space.items():
+                if isinstance(space, Discrete):
+                    action_possibilities[action_name] = list(range(space.start, space.start + space.n))
+                elif isinstance(space, Box) and space.dtype in [np.int32, np.int64]:
+                    low, high = int(space.low), int(space.high)
+                    action_possibilities[action_name] = list(range(low, high + 1))
+
+            keys = list(action_possibilities.keys())
+            value_combinations = itertools.product(*[action_possibilities[k] for k in keys])
+
+            for values in value_combinations:
+                action = {k: v for k, v in zip(keys, values)}
+                sim_actions = sampler.prepare_actions_for_sim(action)
+                if sampler.check_action_preconditions(sim_actions, silent=True):
+                    valid_actions.append(action)
+
+            return valid_actions
+
+        # Vectorized: check valid actions per agent
+        result = {}
+
+        for action_name, space in self.action_space.items():
+            if isinstance(space, Box) and space.dtype in [np.int32, np.int64]:
+                # Get number of agents from shape
+                num_agents = space.shape[0] if len(space.shape) > 0 else 1
+
+                # Get possible values for this action
+                low = int(space.low.flat[0]) if space.low.shape else int(space.low)
+                high = int(space.high.flat[0]) if space.high.shape else int(space.high)
+                possible_values = list(range(low, high + 1))
+                num_values = len(possible_values)
+
+                # Initialize mask matrix: [num_agents x num_action_values]
+                valid_mask = np.zeros((num_agents, num_values), dtype=np.int32)
+
+                # Test each agent-action combination independently
+                # Set other agents to noop (0) to test each agent in isolation
+                for agent_idx in range(num_agents):
+                    for value_idx, value in enumerate(possible_values):
+                        # Create test action with this value for this agent, noop for others
+                        test_action_values = [0] * num_agents
+                        test_action_values[agent_idx] = value
+                        test_action = {action_name: np.array(test_action_values, dtype=np.int32)}
+                        sim_actions = sampler.prepare_actions_for_sim(test_action)
+
+                        # Mark as valid if preconditions pass
+                        if sampler.check_action_preconditions(sim_actions, silent=True):
+                            valid_mask[agent_idx, value_idx] = 1
+
+                # Convert to list of lists for consistency with previous API
+                result[action_name] = valid_mask.tolist()
+
+        return result
+
+    def is_action_valid(self, action: Any) -> bool:
+        """Check if a specific action satisfies action preconditions.
+
+        Args:
+            action: The action dictionary to check
+
+        Returns:
+            True if action is valid, False otherwise
+        """
+        sampler = self.sampler
+        sim_actions = sampler.prepare_actions_for_sim(action)
+        return sampler.check_action_preconditions(sim_actions, silent=True)
+
     def reset(self, seed: Optional[int]=None,
               options: Optional[Any]=None) -> Tuple[Any, Any]:
         if seed is not None:
