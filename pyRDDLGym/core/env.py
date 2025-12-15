@@ -260,42 +260,55 @@ class RDDLEnv(gym.Env):
 
         return obs, reward, terminated, truncated, {}
 
-    def get_available_actions(self) -> Union[List[Any], typing.Dict[str, List]]:
-        """Get valid actions for each agent separately.
+    def get_available_actions(self) -> typing.Dict[str, typing.Dict[str, List]]:
+        """Get valid actions for each agent separately as binary masks.
 
-        For vectorized (multi-agent) environments, returns a dictionary mapping
-        action fluent names to lists of valid values per agent.
-        For non-vectorized environments, returns a list of valid action values.
+        For both vectorized and non-vectorized environments, returns a dictionary
+        mapping action fluent names to dictionaries of binary masks.
 
         Returns:
-            For vectorized: Dict mapping action names to list of valid value lists per agent
-            For non-vectorized: List of valid action dictionaries
+            Dict mapping action names to dict of grounded action names to binary masks [0 or 1]
+            Example: {'move': {'move___a1': [1,0,1,0,1], 'move___a2': [1,1,0,0,1]}}
         """
         sampler = self.sampler
 
         if not self.vectorized:
-            # Non-vectorized: enumerate all valid action combinations
-            import itertools
-            valid_actions = []
-            action_possibilities = {}
+            # Non-vectorized: check each grounded action independently
+            result = {}
 
             for action_name, space in self.action_space.items():
+                # Parse base action name and agent from grounded name
+                # action_name is like 'move___a1'
+                base_name = action_name.split('___')[0] if '___' in action_name else action_name
+
+                if base_name not in result:
+                    result[base_name] = {}
+
                 if isinstance(space, Discrete):
-                    action_possibilities[action_name] = list(range(space.start, space.start + space.n))
+                    possible_values = list(range(space.start, space.start + space.n))
                 elif isinstance(space, Box) and space.dtype in [np.int32, np.int64]:
                     low, high = int(space.low), int(space.high)
-                    action_possibilities[action_name] = list(range(low, high + 1))
+                    possible_values = list(range(low, high + 1))
+                else:
+                    continue
 
-            keys = list(action_possibilities.keys())
-            value_combinations = itertools.product(*[action_possibilities[k] for k in keys])
+                num_values = len(possible_values)
+                valid_mask = [0] * num_values
 
-            for values in value_combinations:
-                action = {k: v for k, v in zip(keys, values)}
-                sim_actions = sampler.prepare_actions_for_sim(action)
-                if sampler.check_action_preconditions(sim_actions, silent=True):
-                    valid_actions.append(action)
+                # Test each action value for this grounded action
+                for value_idx, value in enumerate(possible_values):
+                    # Create test action with this value for this grounded action, noop (0) for others
+                    test_action = {k: 0 for k in self.action_space.keys()}
+                    test_action[action_name] = value
+                    sim_actions = sampler.prepare_actions_for_sim(test_action)
 
-            return valid_actions
+                    # Mark as valid if preconditions pass
+                    if sampler.check_action_preconditions(sim_actions, silent=True):
+                        valid_mask[value_idx] = 1
+
+                result[base_name][action_name] = valid_mask
+
+            return result
 
         # Vectorized: check valid actions per agent
         result = {}
